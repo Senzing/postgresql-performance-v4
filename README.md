@@ -2,7 +2,7 @@
 
 Performance tuning for running **Senzing v4** on **PostgreSQL 18** under high-throughput load —
 companion to
-[performance-general](https://github.com/Senzing/performance-general/blob/main/README.md). Apply the
+[performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply the
 `postgresql.conf` profile and the per-table DDL below **after** the standard Senzing v4 schema and
 **before** loading; each `ALTER TABLE` / index step is metadata-only on the empty tables (instant).
 
