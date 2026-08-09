@@ -176,6 +176,42 @@ track_activity_query_size = 4096
 > nothing. `pgBouncer` is **not** a workaround for an ADVISORY arm: the engine uses session-scoped
 > `pg_advisory_lock` spanning statements, so transaction-mode pooling would misplace locks.
 
+## Connection hygiene — reap dead sessions holding advisory locks
+
+Because the ADVISORY arm uses **session-scoped `pg_advisory_lock`** (held across transactions until the
+session ends — see the pooling note above), a **dead app session is a fleet-wide hazard**. If a worker
+host OOMs, crashes, or its process is killed, its backend keeps holding entity advisory locks, and every
+other worker that needs those entities **blocks behind a session that will never return**. PostgreSQL's
+defaults do not reap it: `tcp_keepalives_*` are `0` (→ the OS default, ~2 h) and
+`idle_in_transaction_session_timeout` is `0` (off) — so one dead host can convoy the whole fleet to ~0
+throughput until the orphaned backends are terminated by hand.
+
+```conf
+tcp_keepalives_idle = 60            # probe an idle connection after 60s
+tcp_keepalives_interval = 10        # then every 10s
+tcp_keepalives_count = 6            # drop after 6 failed probes (~120s to detect a dead peer)
+idle_in_transaction_session_timeout = 300000   # 5 min — reap a session wedged mid-transaction
+```
+
+Measured on a live 18-container/host arm after one host OOM'd: **314 orphaned backends** survived that
+host's reboot (with keepalives off, PG never learned the clients were gone), still holding advisory entity
+locks that blocked the *surviving* host's workers → RabbitMQ ack rate **0**. Terminating them
+(`pg_terminate_backend`) restored the drain instantly (**0 → ~1,050 rec/s**); the settings above make that
+recovery automatic.
+
+> [!WARNING]
+> **These reap a *dead* peer, not a *frozen* one.** During a live-host freeze (OOM thrash where the kernel
+> still answers TCP) keepalives pass, and a plain-`idle` session is not in a transaction, so **neither**
+> knob fires until the host actually dies (e.g. reboots). They shorten the dead-peer detection window from
+> the OS default (~2 h) to ~2 min — they do not cover a wedged-but-alive host. Bounding per-container
+> memory so a host cannot thrash into OOM is the complementary fix.
+>
+> `idle_in_transaction_session_timeout` is safe here only because the engine's transactions are short
+> (sub-second): it fires on a session that *opened a transaction and then went silent* for 5 min, which a
+> healthy worker never does (a long-running *statement* is governed by `statement_timeout`, not this). Do
+> **not** substitute `idle_session_timeout` — it would drop healthy pooled idle connections and cause
+> reconnect churn.
+
 <details>
 <summary><b>Full <code>postgresql.conf</code> profile</b> (the exact <code>ALTER SYSTEM</code> set)</summary>
 
@@ -224,6 +260,11 @@ ALTER SYSTEM SET autovacuum_freeze_max_age = 400000000;
 ALTER SYSTEM SET log_autovacuum_min_duration = 1000;
 ALTER SYSTEM SET maintenance_work_mem = '2GB';
 ALTER SYSTEM SET autovacuum_work_mem = '2GB';
+-- Connection hygiene (reap dead sessions holding session-scoped advisory locks)
+ALTER SYSTEM SET tcp_keepalives_idle = 60;
+ALTER SYSTEM SET tcp_keepalives_interval = 10;
+ALTER SYSTEM SET tcp_keepalives_count = 6;
+ALTER SYSTEM SET idle_in_transaction_session_timeout = 300000;   -- 5 min; engine txns are sub-second
 -- Misc
 ALTER SYSTEM SET default_toast_compression = 'lz4';
 ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
@@ -570,6 +611,15 @@ FROM pg_stat_user_tables WHERE n_tup_upd>0 ORDER BY n_tup_upd DESC;
 SELECT pid, to_char(now()-xact_start,'HH24:MI:SS') dur, backend_type, left(query,45) q
 FROM pg_stat_activity WHERE backend_xmin IS NOT NULL ORDER BY age(backend_xmin) DESC LIMIT 5;
 
+-- Orphaned-lock convoy — sessions blocked by an IDLE holder (a dead/frozen app worker in ADVISORY mode).
+-- A blocker in state 'idle' holds no transaction, so it can only be blocking via a session-scoped
+-- advisory lock — the signature of a crashed host that connection hygiene (above) will reap.
+SELECT ka.pid AS blocker, ka.state, ka.client_addr, count(DISTINCT bl.pid) AS blocking
+FROM pg_stat_activity bl
+JOIN LATERAL unnest(pg_blocking_pids(bl.pid)) AS b(pid) ON true
+JOIN pg_stat_activity ka ON ka.pid = b.pid
+WHERE ka.state = 'idle' GROUP BY 1,2,3 ORDER BY 4 DESC;
+
 -- XID wraparound watch (across ALL relkinds incl. TOAST/catalog) — alert >70%, panic >90%
 SELECT c.oid::regclass, c.relkind, age(c.relfrozenxid)
 FROM pg_class c WHERE c.relfrozenxid<>0 AND c.relkind IN ('r','t','m') ORDER BY 3 DESC LIMIT 10;
@@ -597,6 +647,11 @@ FROM pg_class c WHERE c.relfrozenxid<>0 AND c.relkind IN ('r','t','m') ORDER BY 
 - **Autovacuum is a run-blocker, not hygiene.** The v4 repair fan-out burns ~10 XIDs/record; without
   desynchronized per-table triggering + enough workers + proactive freeze, a synchronized vacuum stampede
   starves a tiny catalog and drives XID age toward wraparound. This tuning ranks with the rest.
+- **In ADVISORY mode a dead app session is a fleet hazard.** Session-scoped advisory locks outlive a
+  crashed/OOM'd worker, and PG's default keepalives (~2 h) leave them held — one dead host convoyed the
+  whole fleet to **0 rec/s** until its 314 orphaned backends were terminated. `tcp_keepalives_*` +
+  `idle_in_transaction_session_timeout` reap the dead session in ~2 min and make recovery automatic — but
+  they do **not** cover a live-host freeze, so bound per-host memory too.
 - **The covering index is PG-specific and VM-gated.** PG has no clustered index, so the by-feature
   `obs_ent_cnt` heap fetch (free on MSSQL) must be covered on the PK — but the index-only payoff only lands
   when autovacuum keeps the visibility map fresh. The index and the autovacuum scheme are one lever.
