@@ -531,6 +531,35 @@ CREATE INDEX res_feat_ekey_sk ON res_feat_ekey (res_ent_id, ftype_id);
 > CIC holds the xmin horizon for its whole (multi-hour, IO-starved) duration and causes DB-wide transient
 > bloat; run them one at a time. No FKs reference `res_feat_ekey` (verified), so the PK drop/swap is safe.
 
+## ⭐ Drop IX_EVAL_QUEUE — redundant with the primary key
+
+`SYS_EVAL_QUEUE` ships two unique indexes: the PK on `MSG_ID` and `IX_EVAL_QUEUE (ENT_SRC_KEY,
+DSRC_CODE)`. The second is **redundant** — drop it to remove one B-tree insert and one unique check
+from every redo enqueue, on the hottest queue in the system.
+
+Why it is safe:
+
+- The engine enqueues with `INSERT INTO SYS_EVAL_QUEUE(MSG_ID, DSRC_CODE, ENT_SRC_KEY, MSG) … ON
+  CONFLICT DO NOTHING`, where `MSG_ID = fnv1a_hash(encrypted ENT_SRC_KEY) >> 1` (deterministic in
+  `ENT_SRC_KEY`) and `DSRC_CODE` is the constant `'__REPAIR__'`. So `(ENT_SRC_KEY, DSRC_CODE)` and
+  `MSG_ID` are **both 1:1 with the entity** — one entity always targets exactly one row.
+- The `ON CONFLICT DO NOTHING` carries **no explicit conflict target**, so PG's arbiter is *any*
+  unique index; with `IX_EVAL_QUEUE` gone it dedups on the PK, unchanged. The engine's intended
+  "a duplicate repair intent is a no-op" dedup is preserved by the PK alone.
+- Every read path is by `MSG_ID` (the `FOR UPDATE SKIP LOCKED` dequeue, count, min/max) — nothing
+  seeks on `(ENT_SRC_KEY, DSRC_CODE)`. On the fleet the redo-dequeue lock waits were **100% on the
+  PK, 0 on `IX_EVAL_QUEUE`**.
+
+```sql
+-- after standard Senzing v4 schema creation (or on a live load: a brief ACCESS EXCLUSIVE lock, but
+-- fast — metadata + unlink, no table scan):
+DROP INDEX IF EXISTS ix_eval_queue;
+```
+
+> [!NOTE]
+> This is a **write-path** win (one fewer index maintained per enqueue on a hot, high-churn queue),
+> not a dequeue fix — the redo-dequeue convoy is a separate, PK-side concern.
+
 ## No heap compression
 
 PG has **no heap compression** (MSSQL's PAGE/ROW compression has no equivalent — only TOAST is `lz4`
