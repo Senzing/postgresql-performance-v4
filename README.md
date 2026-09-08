@@ -155,6 +155,7 @@ and the covering index below). Neither is an AIO knob.
 
 ```conf
 max_connections = 1000
+max_worker_processes = 96             # hard cap on ALL bgworkers — must exceed the pools below
 max_parallel_workers = 64
 max_parallel_workers_per_gather = 8
 max_parallel_maintenance_workers = 16
@@ -166,6 +167,17 @@ autovacuum_work_mem = 2GB
 shared_preload_libraries = 'pg_stat_statements'
 track_activity_query_size = 4096
 ```
+
+> [!WARNING]
+> **`max_worker_processes` is the hard cap on *all* background workers** (parallel query, parallel
+> maintenance, and other bgworkers), and it defaults to **8** — which silently throttles
+> `max_parallel_maintenance_workers = 16`, so a multi-TB index build that should fan out to 16 workers
+> gets ~8 and "takes forever". Size it above the parallel pools plus the autovacuum slots (16), with
+> headroom. It is **`POSTMASTER` context — it needs a restart** (not `SIGHUP`), so set it before the run.
+> Also note: **`CREATE INDEX CONCURRENTLY` is single-threaded in PostgreSQL and ignores every parallel
+> setting** — only a plain `CREATE INDEX` (i.e. build the index set at pristine schema-creation, before
+> load, or with the fleet down) parallelizes. Do not expect a parallel build when adding an index to a
+> live load.
 
 > [!NOTE]
 > **The `BufferMapping` 256-partition limit bounds concurrently EXECUTING backends, not established
@@ -245,6 +257,7 @@ ALTER SYSTEM SET random_page_cost = 1.1;
 ALTER SYSTEM SET cpu_tuple_cost = 0.03;
 -- Parallelism / planner
 ALTER SYSTEM SET max_connections = 1000;
+ALTER SYSTEM SET max_worker_processes = 96;   -- POSTMASTER context (needs restart); caps all bgworkers
 ALTER SYSTEM SET max_parallel_workers = 64;
 ALTER SYSTEM SET max_parallel_workers_per_gather = 8;
 ALTER SYSTEM SET max_parallel_maintenance_workers = 16;
