@@ -31,6 +31,69 @@ final.
 
 ---
 
+# Test platform — the hardware behind these numbers
+
+Every measured result on this page came off the rig described here. Read the numbers against it: the
+levers that matter most are **ratios** — working set vs. buffer pool, reads per record — so a box with a
+different memory-to-dataset ratio will rank them differently.
+
+## Database server (one host, database only — no engine)
+
+| | |
+|---|---|
+| Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
+| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
+| Memory | **1 TiB** — 16 × 64 GB DDR5-4800 (2R ECC), 16 of 32 slots populated, 2 NUMA nodes |
+| Data volume | **22 × Micron 7450 PRO 1.92 TB** U.3 NVMe in **RAID 10** behind a GRAID SupremeRAID controller (GPU-offloaded RAID, driver 1.7.2) → a single 19 TiB (21.1 TB) block device, `ext4`, holding all database files and the log |
+| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate NIC/subnet) |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+
+## Application servers (two hosts, identical)
+
+| | |
+|---|---|
+| Chassis | Dell **PowerEdge R650xs** |
+| CPU | 2 × Intel **Xeon Gold 6326** (Ice Lake) — **32 cores / 64 threads** per host, 2.9 GHz base / 3.5 GHz turbo, 24 MiB L3 per socket |
+| Memory | **512 GiB** — 8 × 64 GB DDR4-3200 (2R ECC), 8 of 16 slots populated, 2 NUMA nodes |
+| Local storage | Dell BOSS SATA boot + 4–8 TB local NVMe for datasets/scratch — **not** on the database IO path |
+| Network | 10 GbE, same data-plane segment as the database server |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+| Role | Runs the containerized Senzing v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
+
+A third small host runs only the message broker that feeds the workers; it is not in the measurement path.
+
+## Database configuration on that hardware
+
+| | |
+|---|---|
+| Engine | PostgreSQL 18, containerized on the database host |
+| Buffer pool | `shared_buffers` = **350GB** on **1 GiB huge pages** — `vm.nr_hugepages = 360` reserved at boot (350 GB of pool needs **358** pages; see [Startup requirements](#startup-requirements)) |
+| Remaining RAM | The ~650 GiB outside the pinned huge-page pool carries the OS page cache, ~1000 backends' worth of process memory, and `io_uring` rings |
+| Scale reached | Loads from 100M up to **653M records** — ≈**12.7 TiB** of datastore. PG has no page compression, so it costs ≈**21 KB/record** against MSSQL's ≈17 KB compressed; that is ≈**37×** the buffer pool at 653M, projecting to ≈**57×** at 1B on the same corpus. |
+
+## What this shape implies
+
+- **The buffer pool is deliberately oversubscribed** — ≈37× at the 653M records reached, projecting to
+  ≈57× at 1B. That ratio is the whole point of the test: it is what makes cache-miss random reads the ceiling, and it is also why
+  [`full_page_writes = off`](#-full_page_writes--off) is such a large win here (every dirtied page is a
+  cold first touch that no checkpoint interval can amortize). A dataset small enough to be cache-resident
+  on this box will **not** reproduce these results, which is why results below ~100M records are not
+  meaningful.
+- **The engine, not the database, owns most of the CPU.** 64 application cores drive 64 database cores,
+  and the workload saturates the application side first. Adding database cores is not the scaling lever;
+  adding application hosts and cutting reads/record is.
+- **Storage is not the bottleneck** — the 22-drive RAID 10 array ran the full load at roughly **20×** IOPS
+  headroom, which is the measured basis for the `io_uring` conclusion in
+  [IO — `io_uring`](#io--io_uring-aio): async IO cannot help a workload that emits few independent IOs
+  against storage that is nowhere near saturated.
+- **Nor is the 10 GbE data plane.** The load is an extremely high count of very small round trips, so it
+  is sensitive to round-trip *latency* and round-trip *count*, not to bandwidth.
+- **The parallelism and IO pools below are sized to this box** — `max_worker_processes = 96`,
+  `max_parallel_workers = 64` and `io_workers = 32` are set against 64 database cores and 1 TiB of RAM.
+  Scale them to your own core count rather than copying the numbers.
+
+---
+
 # Server configuration (`postgresql.conf`)
 
 Applied via `ALTER SYSTEM` so a run's DB config is reproducible orchestration, not a manual one-off.
@@ -142,10 +205,10 @@ for more AIO parallelism:
 - You can only fill a deep queue if the workload emits many *independent* IOs. This one is **98.6%
   buffer-hit + app-CPU-bound + serial-dependency point lookups**, so only ~100 IOs are outstanding
   DB-wide. Raising `io_max_concurrency` does not manufacture demand that isn't there.
-- Storage is **not** the wall. On the ~20-device NVMe RAID, raw `iostat` read `%util 86%, aqu-sz 136,
-  186k IOPS` — but `%util` is meaningless for a multi-device array, `aqu-sz 136 ÷ 20 ≈ 7/device` is
-  trivial for enterprise NVMe, and `186k ÷ 20 ≈ 9k IOPS/device` against ~1M-capable parts. **~20×
-  headroom.**
+- Storage is **not** the wall. On the 22-device NVMe RAID 10 (see [Test platform](#test-platform--the-hardware-behind-these-numbers)),
+  raw `iostat` read `%util 86%, aqu-sz 136, 186k IOPS` — but `%util` is meaningless for a multi-device
+  array, `aqu-sz 136 ÷ 22 ≈ 6/device` is trivial for enterprise NVMe, and `186k ÷ 22 ≈ 8.5k IOPS/device`
+  against ~1M-capable parts. **~20× headroom.**
 
 ⇒ The levers that actually use this storage are **(a) more concurrent independent IO demand — more app
 hosts / backends, which the DB has huge headroom for — and (b) fewer reads/record** (the feature store
@@ -224,8 +287,10 @@ recovery automatic.
 > **not** substitute `idle_session_timeout` — it would drop healthy pooled idle connections and cause
 > reconnect churn.
 
+## Full `postgresql.conf` profile
+
 <details>
-<summary><b>Full <code>postgresql.conf</code> profile</b> (the exact <code>ALTER SYSTEM</code> set)</summary>
+<summary><b>Click to expand — the exact <code>ALTER SYSTEM</code> set</b></summary>
 
 ```sql
 -- Memory
