@@ -1,6 +1,13 @@
-<p><img src="assets/senzing-logo.jpg" alt="Senzing logo" width="56"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/senzing-logo-dark-theme.png">
+    <img src="assets/senzing-logo-light-theme.png" alt="Senzing" width="240">
+  </picture>
+</p>
 
-# postgresql-performance
+<h1 align="center">PostgreSQL performance</h1>
+
+<img src="assets/ember-rule.svg" alt="" width="100%" height="4">
 
 Performance tuning for running **SENZING® SDK v4** on **PostgreSQL 18** under high-throughput load —
 companion to
@@ -15,7 +22,7 @@ hardware and data with the checks given, because results depend on the ratio of 
 memory.
 
 > [!IMPORTANT]
-> The single biggest lever is not any switch here — it is **random-access memory (RAM)**. At scale the bottleneck is
+> The single biggest lever is not any switch here — it is **RAM**. At scale the bottleneck is
 > cache-miss read latency, so size `shared_buffers` + `effective_cache_size` to hold as much of the
 > working set as you can (see [Key learnings](#key-learnings)). This repo replaces the older
 > `Senzing/postgresql-performance` repo, which targets the **v3** schema — do not use that repo's DDL
@@ -43,14 +50,14 @@ running load, not yet confirmed on a clean comparison from an empty datastore) a
 
 > [!NOTE]
 > **What's new — running the datastore as three PostgreSQL instances (Senzing SDK 4.4.3).** Findings from a
-> large load on PostgreSQL 18 with ADVISORY lock mode, the `RES_ENT.FEATURES` store, deferred write, and
+> large load on PostgreSQL 18 with ADVISORY lock mode, the `RES_ENT.FEATURES` store, deferred write and
 > `NAMEADDR_KEY` generation disabled in the Senzing configuration. New sections:
 > [three-instance topology](#topology--three-postgresql-instances-on-one-host), a revised
 > [fill-factor scheme](#-fill-factor--per-table-by-measured-update-pattern),
 > [B-tree leaf fill](#-b-tree-leaf-fill--rebuild-the-block-allocated-id-indexes-not-the-random-key-indexes),
 > [drive selection](#drive-selection--read-intensive-nvme-for-data-high-endurance-nvme-for-wal),
 > [how to profile reads and waits](#where-the-time-goes--reads-waits-and-scaling),
-> [why read replicas do not help a load](#read-replicas-do-not-help-the-load), and
+> [why read replicas do not help a load](#read-replicas-do-not-help-the-load) and
 > [restarting an instance safely](#operations--restarting-an-instance-safely). Where a new section
 > supersedes an earlier statement on this page, it says so.
 
@@ -67,11 +74,11 @@ record — so a system with a different memory-to-datastore ratio will rank them
 | | |
 |---|---|
 | Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
-| Central processing unit (CPU) | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — 64 cores / 128 threads total |
+| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — 64 cores / 128 threads total |
 | Memory | **1 TiB** DDR5-4800 ECC, 2 non-uniform memory access (NUMA) nodes |
 | Data volume | 22 × Micron 7450 PRO (read-intensive U.3 NVMe) in RAID 10 behind a GRAID SupremeRAID controller (GPU-offloaded RAID) → one block device, `ext4`, holding all database files and the WAL |
 | Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate network interface card and subnet) |
-| Operating system (OS) | Ubuntu 24.04 LTS, kernel 6.8 |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
 
 ## Application servers (identical hosts)
 
@@ -110,7 +117,7 @@ disposable test datastore.
   touch that no checkpoint interval can amortize). A datastore small enough to stay cache-resident will
   **not** reproduce these findings; test at a datastore size that exceeds your memory if that is what you
   will run.
-- **The Senzing engine, not the database, owns most of the CPU.** The application side saturates first.
+- **The engine, not the database, owns most of the CPU.** The application side saturates first.
   Adding database cores is not the scaling lever; adding application hosts and cutting reads per record is.
 - **Storage was not the bottleneck.** The array ran the load with large input/output operations per second (IOPS) headroom per device — the
   basis for the conclusion in [IO — `io_uring`](#io--io_uring-aio) that async IO cannot help a workload
@@ -145,7 +152,7 @@ pages can leave the buffer pool, no matter how many cores the host has.
 datastore **by table** across several PostgreSQL instances on the same host, using Senzing HYBRID mode
 (the engine routes each table to its own database). Each instance brings its own checkpointer, background
 writer and WAL stream. The split that worked for us puts the two feature-statistics tables in one
-instance, `LIB_FEAT` in a second, and everything else in a third:
+instance, `LIB_FEAT` in a second and everything else in a third:
 
 | Instance | Senzing tables |
 |---|---|
@@ -154,6 +161,7 @@ instance, `LIB_FEAT` in a second, and everything else in a third:
 | LIBFEAT | `LIB_FEAT` |
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#FAF8F3","primaryTextColor":"#18160F","primaryBorderColor":"#F57826","lineColor":"#F57826","secondaryColor":"#FFFFFF","tertiaryColor":"#FAF8F3","edgeLabelBackground":"#FAF8F3","clusterBkg":"#FFFFFF","clusterBorder":"#F57826","fontFamily":"Roboto, Helvetica Neue, Arial, sans-serif"}}}%%
 flowchart LR
     W["Senzing workers<br/>(app hosts)"]
     subgraph DB["One DB host"]
@@ -164,10 +172,6 @@ flowchart LR
     W --> C
     W --> R
     W --> L
-    classDef ember fill:#F57826,stroke:#FF4E1F,color:#0F0D0C
-    classDef obsidian fill:#0F0D0C,stroke:#F57826,color:#FFFFFF
-    class W ember
-    class C,R,L obsidian
 ```
 
 The diagram shows the Senzing workers connecting directly to all three PostgreSQL instances on one
@@ -437,7 +441,7 @@ track_activity_query_size = 4096
 other** host drops toward zero, and many backends wait on advisory locks held by sessions in state
 `idle`.
 
-**Why.** In ADVISORY lock mode the Senzing engine holds **session-scoped `pg_advisory_lock`s** (held
+**Why.** In ADVISORY lock mode the engine holds **session-scoped `pg_advisory_lock`s** (held
 across transactions until the session ends — see the pooling note above). If a worker host dies, its
 backends keep holding entity advisory locks, and every other worker that needs those entities **blocks
 behind a session that will never return**. PostgreSQL's defaults do not reap it: `tcp_keepalives_*` are
@@ -563,7 +567,7 @@ SENZ0087 'FAILED TO LOAD LIBRARY[libpostgresqlplugin.so]: libpq.so.5:
 ```
 
 Build the consumer image with PostgreSQL support, or add only the `libpq` shared-library closure to an
-MSSQL-only image so the Senzing engine library stays byte-identical when you compare database backends.
+MSSQL-only image so the engine library stays byte-identical when you compare database backends.
 Check before launching (distroless images have no shell, so list the image's files instead):
 
 ```bash
@@ -809,7 +813,7 @@ FROM pg_stat_user_tables ORDER BY n_tup_ins + n_tup_upd DESC;
 **Symptom.** The B-tree indexes on `LIB_FEAT_ID` (the `LIB_FEAT` index on `LIB_FEAT_ID` and the
 `RES_FEAT_STAT` primary key) are much larger than their key size suggests, and stay that way.
 
-**Why.** The Senzing engine hands out `LIB_FEAT_ID` values in **per-process blocks**, so concurrent inserts
+**Why.** The engine hands out `LIB_FEAT_ID` values in **per-process blocks**, so concurrent inserts
 land in the middle of the key range instead of at the right-hand edge. Every page split is then a 50/50
 split, and the leaf pages settle at **about half full**. An index on a random key (for example the
 `LIB_FEAT` primary key on `FEAT_HASH, FTYPE_ID, ANONYMIZED`, or the `RES_FEAT_EKEY` primary key) settles at
@@ -1053,7 +1057,7 @@ Track `percentage_used` over days of loading and project when it reaches 100.
 
 # Engine-side settings that drive database load
 
-These are Senzing engine settings, not PostgreSQL knobs, but they dominate the database load profile.
+These are engine settings, not PostgreSQL knobs, but they dominate the database load profile.
 
 - ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing SDK 4.4+**) — the single largest reduction in
   reads per record. On PostgreSQL the column is added with `ALTER TABLE res_ent ADD COLUMN features text;`
@@ -1103,9 +1107,9 @@ These are Senzing engine settings, not PostgreSQL knobs, but they dominate the d
 > **A load into an empty datastore can be dramatically slower than the same load into a warm one.** This
 > was an **engine** defect, not a PostgreSQL one: redundant no-op writes of an already-set `ENT_STATE`
 > flag on `RES_ENT` each held a row lock across a whole deferred-write flush, so a few hot entities
-> serialized every worker. It was fixed in the Senzing engine with a guarded conditional write, and it
+> serialized every worker. It was fixed in the engine with a guarded conditional write, and it
 > disappears once the datastore is warm. If an empty-datastore load crawls while lock waits concentrate
-> on a handful of `RES_ENT` rows, it is not a database-tuning problem — check the Senzing engine version
+> on a handful of `RES_ENT` rows, it is not a database-tuning problem — check the engine version
 > with Senzing support. To see the concentration:
 >
 > ```sql
@@ -1139,7 +1143,7 @@ measured miss share, and cut reads per record with the
 [covering index](#-cover-res_feat_ekey--the-pg-specific-index-fix).
 
 **Avoid.** A covering index on `FEAT_HASH` to skip the `LIB_FEAT` heap read. The index would be a
-near-copy of the table, its leaves would miss cache just as often, and it trades one random read for
+near-copy of the table, its leaves would miss cache just as often and it trades one random read for
 another plus a second copy of the data to write.
 
 **How to check.** Snapshot the per-object miss counters twice, some minutes apart, on every instance;
@@ -1207,7 +1211,7 @@ faster.
 - **The standby repeats the random IO on one process.** With `full_page_writes = off`, a standby's single
   WAL-replay process must read every target page before applying a change, so it repeats the
   write-driven random reads serially.
-- **The Senzing engine needs read-your-writes** for feature de-duplication and statistics; a lagging
+- **The engine needs read-your-writes** for feature de-duplication and statistics; a lagging
   replica would return stale answers.
 - **Senzing HYBRID mode routes by table, not by read or write.** There is no setting that sends reads to a
   replica.
@@ -1240,7 +1244,7 @@ WHERE backend_type = 'startup';
 
 # Operations — restarting an instance safely
 
-**Symptom.** A restart takes a long time, or the instance comes back through crash recovery, or it does
+**Symptom.** A restart takes a long time, the instance comes back through crash recovery or it does
 not start at all.
 
 **Why.** A shutdown must flush every dirty buffer; with a large buffer pool that takes a while, and a
