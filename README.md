@@ -1,3 +1,5 @@
+<p><img src="assets/senzing-logo.jpg" alt="Senzing logo" width="56"></p>
+
 # postgresql-performance
 
 Performance tuning for running **Senzing v4** on **PostgreSQL 18** under high-throughput load —
