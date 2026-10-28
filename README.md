@@ -28,6 +28,21 @@ final.
 | ⭐ [Cover RES_FEAT_EKEY on the PK](#-cover-res_feat_ekey--the-pg-specific-index-fix) | PG has no clustered index, so the by-feature `OBS_ENT_CNT` heap fetch must be covered | index-only scan _(provisional — VM-gated)_ |
 | [`ftype_id` on the by-entity index](#-cover-res_feat_ekey--the-pg-specific-index-fix) | Seek instead of read-all-then-filter on the by-entity path | free (immutable `smallint` key) |
 | [`io_method = io_uring`](#io--io_uring-aio) | PG18 async read IO | working; storage has **~20×** headroom |
+| ⭐ [Three PG instances, split by table](#topology--three-postgresql-instances-on-one-host) | 3 checkpointers, 3 bgwriters, 3 WAL streams instead of one of each | ~2,110 rec/s on 3 app hosts → **~2,670 (+27%)** on 4 |
+| ⭐ [Fill factor by measured update pattern](#-fill-factor--per-table-by-measured-update-pattern) | Packs insert/delete-only tables; reserves a gap only where HOT updates use it | `RES_FEAT_STAT`: **99.7%** HOT |
+| ⭐ [Rebuild the block-allocated ID indexes](#-b-tree-leaf-fill--rebuild-the-id-indexes-not-the-hash-indexes) | `LIB_FEAT_ID` indexes fill to ~51%; a rebuild stays dense | `LIB_FEAT_ID` index **131 → 79 GB (−40%)** |
+
+> [!NOTE]
+> **What's new — the three-instance reload (Senzing 4.4.3, build 4.4.3.26295).** A reload of a
+> 1.6B-record corporate-registry dataset on PostgreSQL 18 with ADVISORY lock mode, the `RES_ENT.FEATURES`
+> store, deferred write, and `NAMEADDR_KEY` generation disabled in the config. It adds the
+> [three-instance topology](#topology--three-postgresql-instances-on-one-host), a revised
+> [fill-factor scheme](#-fill-factor--per-table-by-measured-update-pattern),
+> [B-tree leaf-fill findings](#-b-tree-leaf-fill--rebuild-the-id-indexes-not-the-hash-indexes), a
+> measured [read and wait profile](#where-the-time-goes--reads-waits-and-scaling),
+> [why read replicas do not help a load](#read-replicas-do-not-help-the-load), and
+> [restart operations](#operations--restarting-an-instance-safely). Where these supersede an earlier
+> statement on this page, the section says so.
 
 ---
 
@@ -62,6 +77,11 @@ different memory-to-dataset ratio will rank them differently.
 
 A third small host runs only the message broker that feeds the workers; it is not in the measurement path.
 
+The three-instance reload ran its workers on **three, then four** application hosts (see
+[Topology](#topology--three-postgresql-instances-on-one-host)); the database host's data volume for that
+run was the same 22 NVMe drives as **Linux `md` RAID 0** (128 KiB chunk, 43.1 TB, `ext4` `noatime,data=writeback`)
+instead of the GRAID RAID 10 above — no redundancy, chosen for capacity on a disposable test datastore.
+
 ## Database configuration on that hardware
 
 | | |
@@ -91,6 +111,54 @@ A third small host runs only the message broker that feeds the workers; it is no
 - **The parallelism and IO pools below are sized to this box** — `max_worker_processes = 96`,
   `max_parallel_workers = 64` and `io_workers = 32` are set against 64 database cores and 1 TiB of RAM.
   Scale them to your own core count rather than copying the numbers.
+
+---
+
+# Topology — three PostgreSQL instances on one host
+
+Each PostgreSQL instance has **one checkpointer and one background writer**, and on this load both are
+CPU-bound in the kernel's buffered-write path. A single instance therefore caps how fast dirty pages can
+leave the buffer pool, no matter how many cores the host has. Senzing's HYBRID mode routes tables to
+different databases, so the reload split the datastore **by table** across three PG18 instances on the same
+DB host (1 TB RAM, 128 hardware threads, 22 × NVMe `md` RAID 0). That gives three checkpointers, three bgwriters and
+three WAL streams.
+
+```mermaid
+flowchart LR
+    subgraph APP["App hosts (3, then 4)"]
+        W["Senzing workers<br/>38 → 56 consumers × 12 threads"]
+    end
+    subgraph DB["DB host — 1 TB RAM, 22 × NVMe md RAID 0"]
+        C["core instance<br/>every other table<br/>shared_buffers 80 GB"]
+        R["RES instance<br/>RES_FEAT_EKEY + RES_FEAT_STAT<br/>shared_buffers 135 GB"]
+        L["LIBFEAT instance<br/>LIB_FEAT<br/>shared_buffers 125 GB"]
+    end
+    W --> C
+    W --> R
+    W --> L
+    classDef ember fill:#F57826,stroke:#FF4E1F,color:#0F0D0C
+    classDef obsidian fill:#0F0D0C,stroke:#F57826,color:#FFFFFF
+    class W ember
+    class C,R,L obsidian
+```
+
+| Instance | Tables | `shared_buffers` (1 GiB huge pages) |
+|---|---|---|
+| core | everything not listed below | 80 GB |
+| RES | `RES_FEAT_EKEY`, `RES_FEAT_STAT` | 135 GB |
+| LIBFEAT | `LIB_FEAT` | 125 GB |
+
+| Fleet | Throughput |
+|---|---|
+| 38 consumers × 12 threads on 3 app hosts | ~2,110 rec/s |
+| 56 consumers × 12 threads on 4 app hosts (at ~140M records) | **~2,670 rec/s (+27%)** |
+
+The +27% from one more app host is the practical result: with the write path spread over three instances,
+the load scales with application capacity (see [Where the time goes](#where-the-time-goes--reads-waits-and-scaling)).
+
+> [!NOTE]
+> The three pools total 340 GB, close to the single-instance 350 GB control used elsewhere on this page.
+> Size each pool to its tables' share of the reads — the two feature instances take most of it.
 
 ---
 
@@ -152,6 +220,9 @@ throughput-vs-idle together revealed it.
 > **on** so such a page is at least *detected* (not silently returned). Only run FPW off on
 > torn-write-safe storage (enterprise NVMe with power-loss protection; verify the array's atomic-write /
 > RAID-chunk unit is ≥ 8 KB) and never where the data is durability-critical.
+>
+> It is also a **load-only, no-replica** setting: if you attach read replicas, turn it back on — see
+> [Read replicas](#read-replicas-do-not-help-the-load).
 
 > [!NOTE]
 > With `full_page_writes = off`, `wal_compression = lz4` becomes a near no-op — it only compressed the
@@ -378,12 +449,19 @@ c=$(docker create <image>); docker export $c | tar -t | grep -cE 'libpq\.so'; do
 ## 2. `shared_buffers = 350GB` + `huge_pages = on` needs **358** 1 GiB huge pages, not 350
 
 Total shared memory is `shared_buffers` **plus** ~8 GiB of fixed structures (buffer descriptors, the
-buffer mapping table, `wal_buffers`, SLRU), which rounds **up** at 1 GiB granularity. It is **not** driven
-by `max_connections` (1000 and 400 both report 358). Never guess — ask PG:
+buffer mapping table, `wal_buffers`, SLRU), which rounds **up** at 1 GiB granularity. Never guess — ask PG:
 
 ```bash
 postgres -D $PGDATA -C shared_memory_size_in_huge_pages     # -> 358
 ```
+
+> [!IMPORTANT]
+> **`max_connections` does move it — superseding an earlier note here** that said 1000 and 400 connections
+> both report 358. The three-instance reload measured **~9 MB of shared memory per connection**, so raising
+> `max_connections` can need more 1 GiB pages than are free. Before restarting with a higher value, compare
+> `SHOW shared_memory_size_in_huge_pages` (after setting the new value) against free huge pages
+> (`grep HugePages_Free /proc/meminfo`); with `huge_pages = on`, PostgreSQL **will not start** if they do not
+> fit.
 
 Set `vm.nr_hugepages = 360` (2 pages margin). This is invisible with 2 MiB pages (8 GiB of overhead is
 just 4,096 extra small pages), which is why `shared_buffers = 350GB` "worked for years" without it.
@@ -518,37 +596,67 @@ Keep `autovacuum_freeze_max_age = 400000000` for now; the near-miss was a throug
 
 # Indexing & storage
 
-## ⭐ Fill factor — per table, by the page-full signal
+## ⭐ Fill factor — per table, by measured update pattern
 
-PostgreSQL heap `fillfactor` tunes **HOT updates**, not index page splits (the MSSQL concern). The signal
-is **`n_tup_newpage_upd` — non-HOT updates caused by a *full page*** (as opposed to an indexed-column
-change, which fillfactor cannot fix). Reserve heap headroom only where non-HOT is page-full; pack the
-insert-mostly tables.
+PostgreSQL heap `fillfactor` tunes **HOT updates**, not index page splits (the MSSQL concern). A gap left
+on each page lets an update write the new row version on the same page, skipping index maintenance. The
+gap only pays if a table's rows are **updated in place**; on insert/delete-only tables it is dead space that
+makes the table larger and colder. So set it from each table's measured update pattern.
 
-The v4 scheme (applied at schema creation — fillfactor only applies at CREATE/REBUILD, so this cannot
-re-densify a live table):
+The scheme used on the three-instance reload (applied at schema creation — fillfactor only applies at
+CREATE/REBUILD, so it cannot re-densify a live table):
 
-| table | `fillfactor` | why |
+| table | `fillfactor` | measured pattern |
 |---|---|---|
-| `res_ent` | 90 | update-heavy but wide rows |
+| `res_feat_ekey`, `res_rel_ekey`, `res_ent_okey`, `sys_eval_queue` | **100** | insert/delete only — no in-place updates to use a gap |
+| `dsrc_record`, `res_relate`, `res_ent` | 90 | some in-place updates |
 | `obs_ent` | 80 | update-heavy |
-| `res_feat_ekey`, `res_feat_stat`, `res_relate`, `res_ent_okey`, `res_rel_ekey`, `dsrc_record` | 70 | churn headroom |
-| `sys_eval_queue` | 70 (+ `autovacuum_vacuum_scale_factor = 0.005`) | the redo-queue hot spot |
-| `lib_feat` | **100** (default, unset) | insert-mostly — density is correct and helps capacity |
+| `res_feat_stat` | **70** | **99.7%** of updates are HOT — they use the gap |
+| `lib_feat` | default (100, unset) | insert-only — density is correct and helps capacity |
+
+> [!IMPORTANT]
+> **This supersedes the earlier scheme on this page**, which set 70 on `res_feat_ekey`, `res_feat_stat`,
+> `res_relate`, `res_ent_okey`, `res_rel_ekey`, `dsrc_record` and `sys_eval_queue`. The earlier provisional
+> candidate — raise `res_feat_ekey` from 70 toward 90–100, because it is 99% inserts — is adopted at 100,
+> and the same reasoning applies to the other insert/delete-only tables. `sys_eval_queue`'s
+> `autovacuum_vacuum_scale_factor = 0.005` is a vacuum setting, independent of fillfactor.
 
 > [!WARNING]
-> **You cannot pick fillfactor from a single `n_tup_newpage_upd` snapshot** — that counter is measured *at
-> the table's current fillfactor* (lower ff → fewer newpage overflows), so reading raw newpage counts as a
-> target reduces headroom on the tables that are already overflowing (the wrong way). The real trade-off
-> pulls two ways: lower ff → more HOT, less vacuum WAL, less bloat (good); but lower ff → fewer live
-> tuples/page → bigger table → more cold-page cache misses, which on a 57×-oversubscribed pool is a real
-> cost. The balance is per-table and needs a **controlled pristine-arm A/B** (HOT% + logical reads/rec +
-> on-disk size together), not a live snapshot.
->
-> **Provisional candidate:** `res_feat_ekey` at ff=70 is 99% inserts on a multi-TB table with only ~5% of
-> its non-HOT being page-full — so ~30% reserved headroom likely buys almost no HOT while costing space and
-> cold pages (the PG analogue of MSSQL's "790 GB of slack for nothing" on ascending keys). Hypothesis:
-> raise it toward 90–100. Test it in a pristine arm before changing it.
+> **Do not pick fillfactor from a single `n_tup_newpage_upd` snapshot.** That counter (non-HOT updates
+> caused by a *full page*) is measured *at the table's current fillfactor*, so reading it raw as a target
+> moves the wrong way on tables already overflowing. Read the update pattern instead — inserts vs deletes
+> vs updates, and the HOT share of updates (`n_tup_hot_upd / n_tup_upd`) — and weigh the cost: lower
+> fillfactor means fewer live tuples per page, a bigger table, and more cold-page misses on an
+> oversubscribed pool.
+
+## ⭐ B-tree leaf fill — rebuild the ID indexes, not the hash indexes
+
+`pageinspect`'s `bt_page_stats` over 2,000 random leaf pages per index, at ~130M records:
+
+| index | key | leaf fill | why |
+|---|---|---|---|
+| `LIB_FEAT` (`LIB_FEAT_ID`) | block-allocated ID | **51%** | IDs are handed out in per-process blocks, so inserts land mid-range and every split is 50/50 |
+| `RES_FEAT_STAT` PK (`LIB_FEAT_ID`) | block-allocated ID | **51%** | same |
+| `LIB_FEAT` PK (`FEAT_HASH, FTYPE_ID, ANONYMIZED`) | random hash | 69.5% | normal for random keys |
+| `RES_FEAT_EKEY` PK | random | 64% | normal for random keys |
+
+The ID indexes are the ones worth rebuilding. `REINDEX INDEX CONCURRENTLY` on the `LIB_FEAT_ID` index,
+run during the live load, took it from **131 GB to 79 GB (−40%)** — and the gain **persists**, because an
+old ID range never receives another insert, so the rebuilt pages stay full. A rebuild of the `RES_FEAT_STAT`
+PK was **in progress** at the time of writing.
+
+Rebuilding a random-key index buys little: inserts keep landing everywhere, so it splits its way back to
+~70%.
+
+```sql
+-- one at a time on a live load; CONCURRENTLY is single-threaded and holds the xmin horizon while it runs
+REINDEX INDEX CONCURRENTLY <lib_feat_id_index>;
+```
+
+> [!NOTE]
+> **Dropping `ANONYMIZED` from the `LIB_FEAT` PK saves nothing.** Lookups are
+> `(FEAT_HASH, FTYPE_ID) IN (...)` point lookups that the existing key already serves, and the 54-byte
+> index tuple MAXALIGNs to 56 bytes either way.
 
 ## ⭐ Cover RES_FEAT_EKEY — the PG-specific index fix
 
@@ -645,14 +753,18 @@ compressed, via `default_toast_compression`). This is a real capacity difference
 
 ## Storage capacity
 
-Size the volume before the run, not after. Reference points, and the honest gap:
+Size the volume before the run, not after. Reference points:
 
 - MSSQL used **~16.4 TiB** for the 1.028 B-record corpus **with PAGE compression**.
-- **No PG bytes/record figure at this scale exists yet.** PG has no heap compression, carries a ~24-byte
-  tuple header, and `lib_feat` alone had **22.2 billion rows** on the MSSQL arm — so any per-row delta is
-  multiplied by 22 B. Expect PG to be materially larger than the MSSQL number; derive the real figure from
-  PG's **own relation sizes** (`pg_relation_size`), never from `df` ÷ record count (other databases on the
-  volume inflate `df`; that error once produced a 14.4% overstatement).
+- **PostgreSQL, three-instance reload: ~21.4 KB/record incremental** across all three databases, and
+  **23.5 KB/record cumulative at 100M records** (with `NAMEADDR_KEY` generation disabled). This
+  supersedes the earlier note here that no PG bytes/record figure existed at scale, and is consistent with
+  the ≈21 KB/record in [Test platform](#test-platform--the-hardware-behind-these-numbers). PG has no heap
+  compression, carries a ~24-byte tuple header, and `lib_feat` alone had **22.2 billion rows** on the MSSQL
+  arm — so any per-row delta is multiplied by 22 B.
+- **How it was measured:** sum `pg_database_size()` over every database, sampled between checkpoints, and
+  divide the delta by records loaded. Never use `df` ÷ record count — other databases on the volume
+  inflate `df`; that error once produced a 14.4% overstatement.
 - On a dedicated DB volume, clear ext4's 5% root reserve (`tune2fs -m 0`) — it is ~984 GB on a 21 TB drive.
 
 ---
@@ -674,12 +786,120 @@ These are Senzing engine settings, not PostgreSQL knobs, but they dominate the l
   name keys generate a self-amplifying redo pile (measured consuming ~33% of capacity, target 20%) that
   starves forward progress. Apply it at bootstrap via the config manager
   (`setGenericThreshold ... behavior NAME ... sendToRedo:"No"`); the combined consumer live-reloads config.
+- **`NAMEADDR_KEY` generation disabled** in the configuration for the three-instance reload. Every number
+  from that reload on this page was measured with it off; compare like with like.
+- **Hub entities and the DLQ.** A few heavily shared entities (for example, registered-agent addresses)
+  draw advisory-lock waits. A record that cannot get its entities within `WORK_RETRY_TIMEOUT` (90 s) goes to
+  the dead-letter queue — **by design**, not a database fault. Run **one** DLQ consumer to work those
+  records back in.
 
 > [!NOTE]
 > ⚠ In testing, a PRISTINE PG load can crater to single-digit rec/s below ~1M records (a since-fixed engine defect:
 > redundant no-op `ENT_STATE` writes held a `res_ent` row lock across a whole flush). This is an **engine**
 > defect, not a PostgreSQL one — fixed by a guarded conditional write — and it is invisible once the DB is
 > warm. If you see 3–9 rec/s from pristine, it is not a DB-tuning problem.
+
+---
+
+# Where the time goes — reads, waits, and scaling
+
+Measured on the [three-instance reload](#topology--three-postgresql-instances-on-one-host) over a 60 s
+delta at ~2,130 rec/s.
+
+## Reads are random, and the cache mostly misses
+
+| | per second | per record |
+|---|---|---|
+| PostgreSQL block reads (buffer-pool misses) | ~405k | ~190 |
+| NVMe reads at the device | ~363k | **≈170** |
+
+The OS page cache absorbs only **~10%** of PostgreSQL's misses. NVMe read latency held at
+**0.12–0.20 ms**. Where the PostgreSQL block reads land, per record:
+
+| object | reads / record |
+|---|---|
+| `LIB_FEAT` PK (`FEAT_HASH, FTYPE_ID, ANONYMIZED`) | 41 |
+| `LIB_FEAT` heap | 34 |
+| `RES_FEAT_STAT` heap | 26 |
+| `LIB_FEAT` (`LIB_FEAT_ID`) index | 20 |
+| `RES_FEAT_STAT` PK | 19 |
+| `RES_FEAT_EKEY` PK | 15 |
+| `RES_FEAT_EKEY` heap | 8 |
+| core instance, all objects | 27 |
+
+The feature tables dominate, and the reads are random: the buffer pool and page cache effectively hold
+only the upper index levels and the hottest features. That is the same conclusion as
+[Key learnings](#key-learnings) — read latency is the ceiling once the working set outgrows memory.
+
+> [!NOTE]
+> **Rejected: a covering index on `FEAT_HASH`.** It would save the `LIB_FEAT` heap read, but the index
+> would be a near-copy of the table, and its leaves would miss cache just as often. It trades one random
+> read for another plus a second copy of the data to write.
+
+## Waits — the database is mostly waiting on the application
+
+A `pg_stat_activity` snapshot of active client backends (the wait-distribution query under
+[Monitoring](#monitoring--whats-going-on)):
+
+Ranked by share:
+
+1. **`ClientRead` — ~45%.** The backend is idle, waiting for the application's next statement.
+2. **`DataFileRead`**, concentrated on `LIB_FEAT`.
+3. **CPU** (no wait event).
+4. **Advisory-lock waits** on a few hub entities (registered-agent addresses).
+
+| host | utilization |
+|---|---|
+| app hosts | **64–70%** busy, CPU pressure 35–59% |
+| DB host | up to **82%** busy, during an index rebuild |
+
+⇒ The load is bound by the application side and by round-trip latency, not by the database. That is why
+[adding a fourth app host gave +27%](#topology--three-postgresql-instances-on-one-host): **add app hosts
+to scale it.**
+
+## Read replicas do not help the load
+
+A streaming replica looks like a way to offload the reads above. For a load it is not:
+
+- **The write path stays on the primary.** Checkpointer, bgwriter and WAL — the reason for the
+  [three-instance split](#topology--three-postgresql-instances-on-one-host) — are not offloaded.
+- **Many reads are write-driven.** An index leaf must be read before an insert into it, unique checks read
+  before they write, and `RES_FEAT_STAT` is read-then-update. Those reads happen wherever the write happens.
+- **The standby repeats the random IO.** With `full_page_writes = off`, a standby's **single** WAL-replay
+  process must read every target page before applying a change, so it re-does the write-driven random
+  reads on one process.
+- **The engine needs read-your-writes** for feature dedup and statistics; a lagging replica would return
+  stale answers.
+- **HYBRID routes by table, not by read/write.** There is no setting to send reads to a replica.
+
+Replicas fit **search, why and how** queries against a finished datastore.
+
+> [!WARNING]
+> **If you run replicas, turn `full_page_writes` back on.** With FPW on, the first change to a page after
+> each checkpoint carries a full-page image, so standby replay **overwrites** the page instead of reading
+> it — removing most of the replay read-modify-write — and the replica, and any promotion, is protected
+> against torn pages. The cost is WAL volume on a random-write workload: roughly one 8 KB image per page
+> per checkpoint cycle in which it is first dirtied. On this load that was **5.14M FPI pages per 60 s and
+> 352 MB/s of WAL, against ~79 MB/s with FPW off** (see [`full_page_writes = off`](#-full_page_writes--off));
+> `wal_compression = lz4` or `zstd` reduces it. FPW off is a **load-only, no-replica** setting that also
+> relies on storage that does not tear 8 KB pages.
+
+---
+
+# Operations — restarting an instance safely
+
+1. **Check huge pages before raising `max_connections`.** Each connection costs ~9 MB of shared memory;
+   see [Startup requirements §2](#2-shared_buffers--350gb--huge_pages--on-needs-358-1-gib-huge-pages-not-350).
+2. **Checkpoint first**, so shutdown has little left to flush:
+   ```sql
+   CHECKPOINT;
+   ```
+3. **Stop with a long timeout**, so shutdown never escalates to `SIGKILL` and a crash recovery:
+   ```bash
+   docker stop -t 900 <pg-container>
+   ```
+
+Done this way, all three instances restarted in **~20 s**.
 
 ---
 
@@ -768,3 +988,12 @@ FROM pg_class c WHERE c.relfrozenxid<>0 AND c.relkind IN ('r','t','m') ORDER BY 
 - **Measure knob comparisons on a pristine DB per arm**, with logical (buffer) reads/rec as the signal —
   physical reads and wall clock are HW/cache-dependent context only. Several findings here are explicitly
   provisional pending that clean A/B.
+- **One instance has one checkpointer and one bgwriter.** When both are CPU-bound in the kernel's
+  buffered-write path, splitting the datastore by table across instances (Senzing HYBRID) multiplies the
+  write path; with that done, a fourth app host added **+27%**.
+- **Set fillfactor by update pattern.** 100 on insert/delete-only tables; a gap only where HOT updates use
+  it (`RES_FEAT_STAT`: 99.7% HOT at 70).
+- **Block-allocated ID indexes fill to ~51%; rebuild them once.** The `LIB_FEAT_ID` index shrank 40% and
+  stays dense. Random-key indexes decay back to ~70% — leave them.
+- **Read replicas do not speed a load**, and they need `full_page_writes = on`. Use them for search on a
+  finished datastore.
