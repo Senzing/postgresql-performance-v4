@@ -2,10 +2,10 @@
 
 # postgresql-performance
 
-Performance tuning for running **SENZING® v4 software** on **PostgreSQL 18** under high-throughput load —
+Performance tuning for running **SENZING® SDK v4** on **PostgreSQL 18** under high-throughput load —
 companion to
 [performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply the
-`postgresql.conf` profile and the per-table data definition language (DDL) below **after** the standard Senzing v4 schema and
+`postgresql.conf` profile and the per-table data definition language (DDL) below **after** the standard Senzing SDK v4 schema and
 **before** loading; each `ALTER TABLE` / index step is metadata-only on the empty tables (instant).
 
 Each section is written to stand on its own: it names the Senzing tables and PostgreSQL settings it
@@ -42,7 +42,7 @@ running load, not yet confirmed on a clean comparison from an empty datastore) a
 | [Drive selection](#drive-selection--read-intensive-nvme-for-data-high-endurance-nvme-for-wal) | Read-intensive NVMe for data, high-endurance NVMe for WAL | Performance where it is read-bound; endurance where it is written |
 
 > [!NOTE]
-> **What's new — running the datastore as three PostgreSQL instances (Senzing engine 4.4.3).** Findings from a
+> **What's new — running the datastore as three PostgreSQL instances (Senzing SDK 4.4.3).** Findings from a
 > large load on PostgreSQL 18 with ADVISORY lock mode, the `RES_ENT.FEATURES` store, deferred write, and
 > `NAMEADDR_KEY` generation disabled in the Senzing configuration. New sections:
 > [three-instance topology](#topology--three-postgresql-instances-on-one-host), a revised
@@ -83,7 +83,7 @@ record — so a system with a different memory-to-datastore ratio will rank them
 | Local storage | Boot drive + local NVMe for datasets/scratch — **not** on the database IO path |
 | Network | 10 GbE, same data-plane segment as the database server |
 | OS | Ubuntu 24.04 LTS, kernel 6.8 |
-| Role | Runs the containerized Senzing v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
+| Role | Runs the containerized Senzing SDK v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
 
 A separate small host runs only the message broker that feeds the workers; it is not in the measurement
 path.
@@ -641,7 +641,7 @@ That repo targets the **v3** schema. Derive PostgreSQL changes from the v4 guida
 
 # Autovacuum & XID wraparound
 
-On a Senzing v4 load, autovacuum tuning is **core, not hygiene** — without it a large load can stop on
+On a Senzing SDK v4 load, autovacuum tuning is **core, not hygiene** — without it a large load can stop on
 transaction-ID wraparound.
 
 ## Why autovacuum is a run-blocker
@@ -650,7 +650,7 @@ transaction-ID wraparound.
 autovacuum worker is busy for hours on the largest tables.
 
 **Why.** PostgreSQL transaction IDs wrap at 2^31; it forces a shutdown before that, and the built-in
-`vacuum_failsafe_age` (default 1.6 billion) is the last-resort emergency vacuum. A Senzing v4 load burns
+`vacuum_failsafe_age` (default 1.6 billion) is the last-resort emergency vacuum. A Senzing SDK v4 load burns
 **several transaction IDs per record** (the deferred-write repair fan-out), so a large load cycles through
 the ID space repeatedly, and freezing must keep pace or the load stops.
 
@@ -879,7 +879,7 @@ Decompose the two halves of a covering index — they have opposite cost profile
   **volatile**, so every count update becomes index maintenance plus a dead tuple instead of a HOT update.
   Justified only where read volume dominates — which it does on the by-feature path.
 
-**Do this.** Build the final index set after the standard Senzing v4 schema creation and before load:
+**Do this.** Build the final index set after the standard Senzing SDK v4 schema creation and before load:
 
 ```sql
 -- (1) The primary key covers the hot by-FEATURE candidate reads index-only (the one justified
@@ -949,7 +949,7 @@ Why it is safe:
 **Do this.**
 
 ```sql
--- After standard Senzing v4 schema creation (or on a live load: a brief ACCESS EXCLUSIVE lock, but
+-- After standard Senzing SDK v4 schema creation (or on a live load: a brief ACCESS EXCLUSIVE lock, but
 -- fast — metadata + unlink, no table scan):
 DROP INDEX IF EXISTS ix_eval_queue;
 ```
@@ -1055,7 +1055,7 @@ Track `percentage_used` over days of loading and project when it reaches 100.
 
 These are Senzing engine settings, not PostgreSQL knobs, but they dominate the database load profile.
 
-- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing engine v4.4+**) — the single largest reduction in
+- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing SDK 4.4+**) — the single largest reduction in
   reads per record. On PostgreSQL the column is added with `ALTER TABLE res_ent ADD COLUMN features text;`
   (PostgreSQL syntax, **not** `VARCHAR(MAX)`); the column's *presence* is what enables the store. Check
   that it is populated — a low share means features are being recomputed:
@@ -1343,7 +1343,7 @@ FROM pg_class c WHERE c.relfrozenxid<>0 AND c.relkind IN ('r','t','m') ORDER BY 
   it corrected a wrong "purely application-bound" reading. A saturated user-CPU figure cannot tell "doing
   work" from "spinning on backpressure"; only throughput and idle CPU together reveal it. Check
   Δ`wal_fpi` ÷ Δ`wal_records` in `pg_stat_wal`. It is a durability trade-off — load-only, no replicas.
-- **Autovacuum is a run-blocker, not hygiene.** The Senzing v4 repair fan-out burns several transaction
+- **Autovacuum is a run-blocker, not hygiene.** The Senzing SDK v4 repair fan-out burns several transaction
   IDs per record; without desynchronized per-table triggering, enough workers and proactive freezing, a
   synchronized vacuum stampede starves a tiny catalog and drives XID age toward wraparound. Watch
   `age(relfrozenxid)` across all relkinds.
