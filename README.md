@@ -2,20 +2,20 @@
 
 # postgresql-performance
 
-Performance tuning for running **Senzing v4** on **PostgreSQL 18** under high-throughput load —
+Performance tuning for running **SENZING® v4 software** on **PostgreSQL 18** under high-throughput load —
 companion to
 [performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply the
-`postgresql.conf` profile and the per-table DDL below **after** the standard Senzing v4 schema and
+`postgresql.conf` profile and the per-table data definition language (DDL) below **after** the standard Senzing v4 schema and
 **before** loading; each `ALTER TABLE` / index step is metadata-only on the empty tables (instant).
 
 Each section is written to stand on its own: it names the Senzing tables and PostgreSQL settings it
-concerns, explains the mechanism, and gives **Do this**, **Avoid** and **How to check** (a query or command
+concerns, explains the mechanism and gives **Do this**, **Avoid** and **How to check** (a query or command
 you can run on your own system). Setting values are recommendations; measure the effect on your own
 hardware and data with the checks given, because results depend on the ratio of your working set to your
 memory.
 
 > [!IMPORTANT]
-> The single biggest lever is not any switch here — it is **RAM**. At scale the bottleneck is
+> The single biggest lever is not any switch here — it is **random-access memory (RAM)**. At scale the bottleneck is
 > cache-miss read latency, so size `shared_buffers` + `effective_cache_size` to hold as much of the
 > working set as you can (see [Key learnings](#key-learnings)). This repo replaces the older
 > `Senzing/postgresql-performance` repo, which targets the **v3** schema — do not use that repo's DDL
@@ -29,20 +29,20 @@ running load, not yet confirmed on a clean comparison from an empty datastore) a
 | Lever | What it does | Effect |
 |---|---|---|
 | ⭐ [`shared_buffers` + huge pages](#memory) | Holds the working set in the buffer pool | The primary lever once the working set outgrows memory |
-| ⭐ [`full_page_writes = off`](#-full_page_writes--off) | Stops logging a full-page image for every first-touched page | Removes most WAL volume and the commit backpressure it causes (test-only durability trade-off) |
-| ⭐ [`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-db-load) _(v4.4+)_ | Engine feature store on `RES_ENT` — collapses reads per record | Largest read reduction |
-| ⭐ [Per-table autovacuum + proactive freeze](#autovacuum--xid-wraparound) | Desynchronizes the vacuum stampede; keeps XID age low | Removes the transaction-ID wraparound run-blocker on large loads |
-| ⭐ [Cover RES_FEAT_EKEY on the PK](#-cover-res_feat_ekey--the-pg-specific-index-fix) | PG has no clustered index, so the by-feature `OBS_ENT_CNT` heap fetch must be covered | Index-only scans _(provisional — visibility-map-gated)_ |
+| ⭐ [`full_page_writes = off`](#-full_page_writes--off) | Stops logging a full-page image for every first-touched page | Removes most write-ahead log (WAL) volume and the commit backpressure it causes (test-only durability trade-off) |
+| ⭐ [`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-database-load) _(v4.4+)_ | Engine feature store on `RES_ENT` — collapses reads per record | Largest read reduction |
+| ⭐ [Per-table autovacuum + proactive freeze](#autovacuum--xid-wraparound) | Desynchronizes the vacuum stampede; keeps transaction ID (XID) age low | Removes the transaction-ID wraparound run-blocker on large loads |
+| ⭐ [Cover RES_FEAT_EKEY on the primary key (PK)](#-cover-res_feat_ekey--the-pg-specific-index-fix) | PostgreSQL (PG) has no clustered index, so the by-feature `OBS_ENT_CNT` heap fetch must be covered | Index-only scans _(provisional — visibility-map-gated)_ |
 | [`ftype_id` on the by-entity index](#-cover-res_feat_ekey--the-pg-specific-index-fix) | Seek instead of read-all-then-filter on the by-entity path | Free (immutable `smallint` key) |
-| [`io_method = io_uring`](#io--io_uring-aio) | PG18 async read IO | Works, but cannot speed dependent point lookups |
+| [`io_method = io_uring`](#io--io_uring-aio) | PG18 asynchronous input/output (IO) reads | Works, but cannot speed dependent point lookups |
 | ⭐ [Three PG instances, split by table](#topology--three-postgresql-instances-on-one-host) | One checkpointer, background writer and WAL stream per instance instead of one for the whole datastore | The write path stops capping the load; it then scales with application hosts |
-| ⭐ [Fill factor by measured update pattern](#-fill-factor--per-table-by-measured-update-pattern) | Packs insert/delete-only tables; reserves a gap only where HOT updates use it | Smaller, denser tables; HOT kept where it is used |
+| ⭐ [Fill factor by measured update pattern](#-fill-factor--per-table-by-measured-update-pattern) | Packs insert/delete-only tables; reserves a gap only where heap-only tuple (HOT) updates use it | Smaller, denser tables; HOT kept where it is used |
 | ⭐ [Rebuild the block-allocated ID indexes](#-b-tree-leaf-fill--rebuild-the-block-allocated-id-indexes-not-the-random-key-indexes) | Block-allocated ID indexes sit about half full; a rebuild packs them and they stay packed | One-time size cut that persists |
 | [Connection hygiene](#connection-hygiene--reap-dead-sessions-holding-advisory-locks) | Reaps dead sessions that still hold session-scoped advisory locks | One crashed worker host no longer stalls every other worker |
 | [Drive selection](#drive-selection--read-intensive-nvme-for-data-high-endurance-nvme-for-wal) | Read-intensive NVMe for data, high-endurance NVMe for WAL | Performance where it is read-bound; endurance where it is written |
 
 > [!NOTE]
-> **What's new — running the datastore as three PostgreSQL instances (Senzing 4.4.3).** Findings from a
+> **What's new — running the datastore as three PostgreSQL instances (Senzing engine 4.4.3).** Findings from a
 > large load on PostgreSQL 18 with ADVISORY lock mode, the `RES_ENT.FEATURES` store, deferred write, and
 > `NAMEADDR_KEY` generation disabled in the Senzing configuration. New sections:
 > [three-instance topology](#topology--three-postgresql-instances-on-one-host), a revised
@@ -67,11 +67,11 @@ record — so a system with a different memory-to-datastore ratio will rank them
 | | |
 |---|---|
 | Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
-| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — 64 cores / 128 threads total |
-| Memory | **1 TiB** DDR5-4800 ECC, 2 NUMA nodes |
+| Central processing unit (CPU) | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — 64 cores / 128 threads total |
+| Memory | **1 TiB** DDR5-4800 ECC, 2 non-uniform memory access (NUMA) nodes |
 | Data volume | 22 × Micron 7450 PRO (read-intensive U.3 NVMe) in RAID 10 behind a GRAID SupremeRAID controller (GPU-offloaded RAID) → one block device, `ext4`, holding all database files and the WAL |
-| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate NIC/subnet) |
-| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate network interface card and subnet) |
+| Operating system (OS) | Ubuntu 24.04 LTS, kernel 6.8 |
 
 ## Application servers (identical hosts)
 
@@ -99,7 +99,7 @@ disposable test datastore.
 |---|---|
 | Engine | PostgreSQL 18, containerized on the database host |
 | Buffer pool | `shared_buffers` = **350GB** on **1 GiB huge pages** — `vm.nr_hugepages = 360` reserved at boot (see [Startup requirements](#startup-requirements) for why 350 GB of pool needs more than 350 pages) |
-| Remaining RAM | Memory outside the pinned huge-page pool carries the OS page cache, the backends' process memory, and `io_uring` rings |
+| Remaining RAM | Memory outside the pinned huge-page pool carries the OS page cache, the backends' process memory and `io_uring` rings |
 | Datastore size | Many times larger than the buffer pool — deliberately (see below) |
 
 ## What this shape implies
@@ -112,7 +112,7 @@ disposable test datastore.
   will run.
 - **The Senzing engine, not the database, owns most of the CPU.** The application side saturates first.
   Adding database cores is not the scaling lever; adding application hosts and cutting reads per record is.
-- **Storage was not the bottleneck.** The array ran the load with large IOPS headroom per device — the
+- **Storage was not the bottleneck.** The array ran the load with large input/output operations per second (IOPS) headroom per device — the
   basis for the conclusion in [IO — `io_uring`](#io--io_uring-aio) that async IO cannot help a workload
   that emits few independent IOs. Check your own headroom with the per-device method in that section.
 - **Nor was the 10 GbE data plane.** The load is a very high count of very small round trips, so it is
@@ -133,7 +133,7 @@ FROM pg_database WHERE NOT datistemplate;
 # Topology — three PostgreSQL instances on one host
 
 **Symptom.** Throughput rises and falls with the checkpoint cycle, the checkpointer or background writer
-process sits near one full CPU core, and client backends start writing out dirty buffers themselves —
+process sits near one full CPU core and client backends start writing out dirty buffers themselves —
 while the host still has idle cores and the storage is far from saturated.
 
 **Why.** Each PostgreSQL instance has exactly **one checkpointer and one background writer**, and one WAL
@@ -260,10 +260,10 @@ full_page_writes = off
 ```
 
 **Symptom.** WAL write volume is far higher than the size of the row changes would suggest, commits wait
-on WAL, and the application hosts look CPU-saturated even though the database is the limit.
+on WAL and the application hosts look CPU-saturated even though the database is the limit.
 
-**Why.** The first change to a page after a checkpoint logs the whole 8 KB page (a full-page image, FPI)
-as torn-write protection. On a cache-oversubscribed bulk load, almost every touched page is a cold,
+**Why.** The first change to a page after a checkpoint logs the whole 8 KB page as a full-page image (FPI)
+for torn-write protection. On a cache-oversubscribed bulk load, almost every touched page is a cold,
 first-touch page that will be evicted long before it is touched again, so the WAL stream becomes almost
 entirely full-page images. **Checkpoint tuning cannot amortize this**: amortization needs a page to be
 changed again within the same checkpoint interval, and here it is not, whatever `checkpoint_timeout` is.
@@ -291,7 +291,7 @@ SELECT now(), wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;
 ```
 
 > [!WARNING]
-> This is a **test-only durability trade-off** (it pairs with `synchronous_commit = off`). With FPW off,
+> This is a **test-only durability trade-off** (it pairs with `synchronous_commit = off`). With full-page writes (FPW) off,
 > a torn page after an unclean crash mid-write is not self-healed by a WAL replay. Keep `data_checksums`
 > **on** so such a page is at least *detected* (not silently returned). Only run FPW off on
 > torn-write-safe storage (enterprise NVMe with power-loss protection; verify the array's atomic-write /
@@ -345,11 +345,11 @@ random_page_cost = 1.1          # fast random reads on NVMe
 cpu_tuple_cost = 0.03
 ```
 
-`io_uring` is active and effective — `pg_aios` shows async reads submitted and in flight. But it does
+`io_uring`, the PostgreSQL asynchronous IO (AIO) method, is active and effective — `pg_aios` shows async reads submitted and in flight. But it does
 **not** raise the ceiling of a Senzing load, for a structural reason worth understanding before you reach
 for more AIO parallelism:
 
-- The OLTP point-lookup path is **latency-bound, not queue-depth-bound**. A single-row index lookup is a
+- The online transaction processing (OLTP) point-lookup path is **latency-bound, not queue-depth-bound**. A single-row index lookup is a
   dependency chain (index root → leaf → heap) with nothing to overlap, so each client backend has about
   one IO in flight. Only maintenance operations (index builds, vacuum) keep many IOs in flight. AIO hides
   queue-depth stalls; it cannot make one random read faster.
@@ -362,7 +362,7 @@ for more AIO parallelism:
 
 **Do this.** Keep `io_method = io_uring`; to use more of the storage, raise **independent** IO demand
 (more application hosts and backends) and cut **reads per record** (the
-[`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-db-load) and the
+[`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-database-load) and the
 [covering index](#-cover-res_feat_ekey--the-pg-specific-index-fix)).
 
 **Avoid.** Raising `io_max_concurrency`, `effective_io_concurrency` or `io_workers` to fix a
@@ -405,12 +405,12 @@ track_activity_query_size = 4096
 
 > [!WARNING]
 > **`max_worker_processes` is the hard cap on *all* background workers** (parallel query, parallel
-> maintenance, and other bgworkers), and it defaults to **8** — which silently throttles
+> maintenance and other bgworkers), and it defaults to **8** — which silently throttles
 > `max_parallel_maintenance_workers = 16`, so a large index build that should fan out to 16 workers gets
 > about half that. Size it above the parallel pools plus the autovacuum slots, with headroom. It is
 > **`POSTMASTER` context — it needs a restart** (not `SIGHUP`), so set it before the load. Also note:
 > **`CREATE INDEX CONCURRENTLY` is single-threaded in PostgreSQL and ignores every parallel setting** —
-> only a plain `CREATE INDEX` (build the index set at schema creation, before load, or with the workers
+> only a plain `CREATE INDEX` (build the index set at schema creation, before load or with the workers
 > stopped) parallelizes. Do not expect a parallel build when adding an index during a running load.
 
 > [!NOTE]
@@ -573,7 +573,7 @@ c=$(docker create <image>); docker export $c | tar -t | grep -cE 'libpq\.so'; do
 ## 2. `shared_buffers = 350GB` + `huge_pages = on` needs **358** 1 GiB huge pages, not 350
 
 Total shared memory is `shared_buffers` **plus** fixed structures (buffer descriptors, the buffer mapping
-table, `wal_buffers`, SLRU caches, the lock table), and the total rounds **up** at 1 GiB granularity. With
+table, `wal_buffers`, simple least-recently-used (SLRU) caches, the lock table), and the total rounds **up** at 1 GiB granularity. With
 these settings that comes to 358 pages. Never guess — ask PostgreSQL:
 
 ```bash
@@ -619,7 +619,7 @@ HINT: Consider increasing "ulimit -n" to at least 2032.
 ```
 
 io_uring needs file descriptors per ring. Run the container with `--ulimit nofile=131072:131072` (plus
-`--security-opt seccomp=unconfined`, `--ulimit memlock=-1:-1`, and `--shm-size=2g`). The common Docker
+`--security-opt seccomp=unconfined`, `--ulimit memlock=-1:-1` and `--shm-size=2g`). The common Docker
 recipe omits `nofile`.
 
 ## 5. Do **not** use `Senzing/postgresql-performance` (v3) for DDL
@@ -629,13 +629,13 @@ That repo targets the **v3** schema. Derive PostgreSQL changes from the v4 guida
 
 | MSSQL v4 lever | PG equivalent |
 |---|---|
-| PAGE compression on hot tables | **none** (no heap compression; only TOAST `lz4`) |
+| PAGE compression on hot tables | **none** (no heap compression; only the oversized-attribute storage technique (TOAST) `lz4`) |
 | clustered PKs | n/a (PG has no clustered index; `CLUSTER` is one-shot) |
 | per-index fill factor | ✅ per-table `fillfactor` (tunes HOT, not page splits — see below) |
 | multi-file presize + `FILEGROWTH` | n/a |
-| ADR / `OPTIMIZED_LOCKING` / RCSI | n/a (PG is natively MVCC) |
+| accelerated database recovery (ADR) / `OPTIMIZED_LOCKING` / read committed snapshot isolation (RCSI) | n/a — PG is natively multiversion concurrency control (MVCC) |
 | `FELEM_VALUES` → `VARCHAR(MAX)` | n/a (`text` is unbounded) |
-| MAXDOP / cost threshold | `max_parallel_workers_per_gather`, `random_page_cost` |
+| maximum degree of parallelism (MAXDOP) / cost threshold | `max_parallel_workers_per_gather`, `random_page_cost` |
 
 ---
 
@@ -1016,8 +1016,7 @@ cannot keep up with the random reads.
 (buffer-pool misses) with a sustained random writeback from the checkpointer and background writer. The
 **WAL** is a continuous sequential write stream that is written once and recycled, so for its capacity it
 absorbs far more bytes written than the data volume: it is the endurance hot spot. Under a continuous
-loader, even the data volume's random writeback can exceed a 1 DWPD (drive writes per day) endurance
-rating.
+loader, even the data volume's random writeback can exceed an endurance rating of one drive write per day (DWPD).
 
 **Do this.**
 - Put the data volume on **read-intensive NVMe** for random-read IOPS and latency, after checking that its
@@ -1052,11 +1051,11 @@ Track `percentage_used` over days of loading and project when it reaches 100.
 
 ---
 
-# Engine-side settings that drive DB load
+# Engine-side settings that drive database load
 
 These are Senzing engine settings, not PostgreSQL knobs, but they dominate the database load profile.
 
-- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing v4.4+**) — the single largest reduction in
+- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing engine v4.4+**) — the single largest reduction in
   reads per record. On PostgreSQL the column is added with `ALTER TABLE res_ent ADD COLUMN features text;`
   (PostgreSQL syntax, **not** `VARCHAR(MAX)`); the column's *presence* is what enables the store. Check
   that it is populated — a low share means features are being recomputed:
@@ -1116,7 +1115,7 @@ These are Senzing engine settings, not PostgreSQL knobs, but they dominate the d
 
 ---
 
-# Where the time goes — reads, waits, and scaling
+# Where the time goes — reads, waits and scaling
 
 Two measurements tell you what limits a Senzing load on PostgreSQL: **where the buffer-pool misses
 land**, and **what the active backends are waiting on**. Both are cheap to take on a live load.
@@ -1136,7 +1135,7 @@ every miss became a random device read. Read latency is then the ceiling (see
 **Do this.** Put memory where the misses are: size `shared_buffers` (or, with
 [several instances](#topology--three-postgresql-instances-on-one-host), each instance's pool) by the
 measured miss share, and cut reads per record with the
-[`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-db-load) and the
+[`RES_ENT.FEATURES` store](#engine-side-settings-that-drive-database-load) and the
 [covering index](#-cover-res_feat_ekey--the-pg-specific-index-fix).
 
 **Avoid.** A covering index on `FEAT_HASH` to skip the `LIB_FEAT` heap read. The index would be a
@@ -1165,7 +1164,7 @@ limit.
 
 **Why.** In our testing the largest share of busy client backends was in `ClientRead` — the backend is
 waiting for the application's next message. Then, in order: `DataFileRead` (concentrated on `LIB_FEAT`),
-CPU (no wait event), and advisory-lock waits on a few highly shared entities. With the application hosts
+CPU (no wait event) and advisory-lock waits on a few highly shared entities. With the application hosts
 busy and the database mostly waiting on them, the load was bound by application capacity and by
 round-trip latency, not by the database.
 
@@ -1203,7 +1202,7 @@ faster.
 - **The write path stays on the primary.** The checkpointer, background writer and WAL — the reason for
   the [three-instance split](#topology--three-postgresql-instances-on-one-host) — are not offloaded.
 - **Many reads are write-driven.** An index leaf must be read before an insert into it, unique checks read
-  before they write, and `RES_FEAT_STAT` is read-then-update. Those reads happen wherever the write
+  before they write and `RES_FEAT_STAT` is read-then-update. Those reads happen wherever the write
   happens.
 - **The standby repeats the random IO on one process.** With `full_page_writes = off`, a standby's single
   WAL-replay process must read every target page before applying a change, so it repeats the
@@ -1215,7 +1214,7 @@ faster.
 
 **Do this.** Use replicas for **search, why and how** queries against a finished datastore. If replicas
 exist, **turn `full_page_writes` back on**: the first change to a page after each checkpoint then carries
-a full-page image (FPI), so standby replay **overwrites** the page instead of reading it first — which
+an FPI, so standby replay **overwrites** the page instead of reading it first — which
 removes most of the replay read-modify-write — and the replica, and any promotion of it, is protected
 against torn pages. The cost is WAL volume on a random-write load (roughly one 8 KB image per page per
 checkpoint cycle in which it is first dirtied); `wal_compression = lz4` or `zstd` reduces it.
