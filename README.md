@@ -1011,6 +1011,27 @@ large volume that reserve is a significant amount of space the database can neve
 inflate `df`. Also avoid `count(*)` on a growing Senzing table to count records — it is slow at scale and
 its scan evicts cache that the running load needs; use the `n_tup_ins` counter above.
 
+## Estimate a dump's size without dumping
+
+**Symptom.** You need the compressed size of a `pg_dump` (for an upload, a migration or a backup target)
+before committing hours to the dump itself.
+
+**Do this.** Copy a block sample of each table through the compressor you will use, and scale by the
+sample fraction. It reads only the sampled pages, so it can run against a live datastore, including
+during a redo drain:
+
+```bash
+# 0.1% block sample of one table, compressed as the dump would be; multiply the byte count by 1,000
+psql -d <db> -Atc "COPY (SELECT * FROM <table> TABLESAMPLE SYSTEM (0.1) REPEATABLE (42)) TO STDOUT" \
+  | zstd -3 -T8 | wc -c
+```
+
+Repeat for every table on every instance, and add the results together. Leave out `SYS_EVAL_QUEUE` if the
+dump will be taken after the redo drain.
+
+**Avoid.** Estimating from `pg_database_size()` and a guessed compression ratio. Indexes are not dumped,
+and the compressibility of the feature tables depends on your data.
+
 ## Drive selection — read-intensive NVMe for data, high-endurance NVMe for WAL
 
 **Symptom.** NVMe drives wear out far faster than their rated life, or a drive chosen for capacity
@@ -1083,11 +1104,22 @@ These are engine settings, not PostgreSQL knobs, but they dominate the database 
 - **On data with many common names, set the generic NAME behavior to `"sendToRedo":"No"`** — otherwise
   generic name keys generate a self-amplifying redo backlog that consumes worker capacity and starves
   forward progress. Apply it at bootstrap with the Senzing configuration tooling
-  (`setGenericThreshold ... behavior NAME ... sendToRedo:"No"`). Check by watching the redo queue: it
-  should not grow faster than the redo processors drain it.
+  (`setGenericThreshold ... behavior NAME ... sendToRedo:"No"`).
+
+  A redo backlog that **grows during the load is expected and efficient**. `SYS_EVAL_QUEUE` holds one
+  entry per entity, so an entity touched many times during the load is re-evaluated once, after its last
+  touch. Don't add redo capacity to keep the backlog flat during the load: that re-evaluates an entity on
+  every touch, which is more total work. The warning sign is a backlog that **does not converge** once the
+  load has finished: the share of redo entries at a higher re-evaluation iteration should fall off
+  sharply. Check the backlog and its iteration mix:
 
   ```sql
-  SELECT count(*) AS redo_backlog FROM sys_eval_queue;   -- small table; sample over time
+  -- Backlog size: use the statistics estimate; count(*) on a large queue is a full scan
+  SELECT n_live_tup AS redo_backlog_estimate FROM pg_stat_user_tables WHERE relname = 'sys_eval_queue';
+
+  -- Iteration mix from a block sample; each re-queue of an entity raises its REEVAL_ITERATION
+  SELECT coalesce(substring(msg FROM '"REEVAL_ITERATION","VALUE":([0-9]+)'), '0') AS iteration, count(*)
+  FROM sys_eval_queue TABLESAMPLE SYSTEM (0.01) GROUP BY 1 ORDER BY 1;
   ```
 
 - **`NAMEADDR_KEY` generation was disabled** in the Senzing configuration for the
@@ -1194,6 +1226,41 @@ WHERE state <> 'idle' AND backend_type = 'client backend' GROUP BY 1, 2, 3 ORDER
 # On each application host: CPU busy, run queue and CPU pressure
 mpstat 60 1; vmstat 60 2; cat /proc/pressure/cpu
 ```
+
+## The post-load redo drain is bound by random-read bandwidth
+
+**Symptom.** After the load finishes and every worker processes redo, the application hosts are mostly
+idle while the data volume reads continuously.
+
+**Why.** Each redo re-evaluates an entity whose features, statistics and relationships are spread across
+the largest tables, so a redo reads many uncached blocks, and per thread a redo costs more than an add.
+The drain then runs at the rate the storage can deliver random reads, and adding workers or application
+hosts does not speed it up.
+
+**Do this.** Size the data volume's **random-read bandwidth** for the drain, not only its capacity and IOPS.
+Estimate the drain time from the backlog and the measured net drain rate, not from the redo processing rate:
+entities that are re-queued during the drain also slow the decline.
+
+**Avoid.** Tuning block-device readahead (`read_ahead_kb`) for the drain. Redo reads are small and random,
+and changing readahead had no measurable effect on the drain rate in our testing.
+
+**How to check.** Compare the data device's read bandwidth with the array's rated or measured ceiling, and
+see which objects take the reads:
+
+```bash
+# rkB/s of the array device, second report; at the array's ceiling, storage is the limit
+iostat -x 60 2
+```
+
+```sql
+-- Reads by backend type and context (read_bytes is PostgreSQL 18; on 16-17 use reads * op_bytes);
+-- sample twice and take the delta
+SELECT backend_type, object, context, reads, read_bytes, read_time FROM pg_stat_io
+WHERE reads > 0 ORDER BY reads DESC LIMIT 10;
+```
+
+Use the [read profile](#read-profile--find-which-tables-and-indexes-the-cache-misses) above to see which
+tables and indexes the misses fall on.
 
 ## Read replicas do not help the load
 
